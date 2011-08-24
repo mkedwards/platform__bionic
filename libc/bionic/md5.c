@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 1995 - 2001 Kungliga Tekniska Högskolan
+ * Copyright (c) 1995 - 2001 Kungliga Tekniska H?gskolan
  * (Royal Institute of Technology, Stockholm, Sweden).
  * All rights reserved.
  * 
@@ -227,7 +227,9 @@ MD5_Update (struct md5 *m, const void *v, size_t len)
       }
       calc(m, current);
 #else
-      calc(m, (u_int32_t*)m->save);
+      u_int32_t current[16];
+      memcpy(current, m->save, sizeof(current));
+      calc(m, current);
 #endif
       offset = 0;
     }
