@@ -111,8 +111,16 @@ extern int format_fd(int, const char *, ...);
 #define RELOC_SYMBOL          3
 #define NUM_RELOC_STATS       4
 
+#define LOOKUP_NUM          0
+#define LOOKUP_FAIL         1
+#define LOOKUP_ELF          2
+#define LOOKUP_GNU          3
+#define LOOKUP_BLOOM        4
+#define NUM_LOOKUP_STATS    5
+
 struct _link_stats {
     int reloc[NUM_RELOC_STATS];
+    int lookup[NUM_LOOKUP_STATS];
 };
 extern struct _link_stats linker_stats;
 
@@ -123,8 +131,17 @@ extern struct _link_stats linker_stats;
                 PRINT("Unknown reloc stat requested\n");  \
              }                                            \
            } while(0)
+#define COUNT_LOOKUP(type)                                \
+        do { if (type >= 0 && type < NUM_LOOKUP_STATS) {  \
+                linker_stats.lookup[type] += 1;           \
+             } else  {                                    \
+                PRINT("Unknown lookup stat requested\n"); \
+             }                                            \
+           } while(0)
+
 #else /* !STATS */
 #define COUNT_RELOC(type)     do {} while(0)
+#define COUNT_LOOKUP(type)     do {} while(0)
 #endif /* STATS */
 
 #if TIMING

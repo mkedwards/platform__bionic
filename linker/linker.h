@@ -114,6 +114,13 @@ struct soinfo
     unsigned *bucket;
     unsigned *chain;
 
+    unsigned gnu_nbucket;
+    unsigned gnu_shift;
+    unsigned gnu_bitmask_words;
+    unsigned *gnu_bitmask;
+    unsigned *gnu_bucket;
+    unsigned *gnu_chain;
+
     unsigned *plt_got;
 
     Elf32_Rel *plt_rel;
