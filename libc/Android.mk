@@ -187,7 +187,6 @@ libc_common_src_files := \
 	string/strcat.c \
 	string/strchr.c \
 	string/strcoll.c \
-	string/strcpy.c \
 	string/strcspn.c \
 	string/strdup.c \
 	string/strerror.c \
@@ -354,12 +353,15 @@ libc_common_src_files += \
 	arch-arm/bionic/setjmp.S \
 	arch-arm/bionic/sigsetjmp.S \
 	arch-arm/bionic/strlen.c.arm \
+	arch-arm/bionic/strcpy.S \
+	arch-arm/bionic/strcmp.S \
 	arch-arm/bionic/syscall.S \
 	string/memmove.c.arm \
 	string/bcopy.c \
-	string/strcmp.c \
 	string/strncmp.c \
 	unistd/socketcalls.c
+
+
 
 # These files need to be arm so that gdbserver
 # can set breakpoints in them without messing
@@ -401,8 +403,9 @@ libc_common_src_files += \
 	arch-x86/string/memset_wrapper.S \
 	arch-x86/string/strcmp_wrapper.S \
 	arch-x86/string/strncmp_wrapper.S \
-	arch-x86/string/strlen.S \
+	arch-x86/string/strlen_wrapper.S \
 	bionic/pthread-rwlocks.c \
+	string/strcpy.c \
 	bionic/pthread-timers.c \
 	bionic/ptrace.c
 
@@ -442,6 +445,7 @@ libc_common_src_files += \
 	string/memcmp.c \
 	string/strlen.c \
 	bionic/pthread-rwlocks.c \
+	string/strcpy.c \
 	bionic/pthread-timers.c \
 	bionic/ptrace.c \
 	unistd/socketcalls.c
@@ -494,6 +498,9 @@ ifeq ($(TARGET_ARCH),arm)
   ifeq ($(ARCH_ARM_HAVE_TLS_REGISTER),true)
     libc_common_cflags += -DHAVE_ARM_TLS_REGISTER
   endif
+  ifeq ($(TARGET_HAVE_TEGRA_ERRATA_657451),true)
+    libc_common_cflags += -DHAVE_TEGRA_ERRATA_657451
+  endif
 else # !arm
   ifeq ($(TARGET_ARCH),x86)
     libc_crt_target_cflags := -m32
@@ -515,6 +522,14 @@ endif
 # crtbegin_xxx.S and crtend_xxx.S
 #
 libc_crt_target_cflags += -I$(LOCAL_PATH)/private
+
+ifeq ($(BOARD_USE_NASTY_PTHREAD_CREATE_HACK),true)
+  libc_common_cflags += -DNASTY_PTHREAD_CREATE_HACK
+endif
+
+ifeq ($(TARGET_ARCH),arm)
+libc_crt_target_cflags += -DCRT_LEGACY_WORKAROUND
+endif
 
 # Define some common includes
 # ========================================================
@@ -540,18 +555,24 @@ ifneq ($(filter arm x86,$(TARGET_ARCH)),)
 # that will call __cxa_finalize(&__dso_handle) in order to ensure that
 # static C++ destructors are properly called on dlclose().
 #
+
+libc_crt_target_so_cflags := $(libc_crt_target_cflags)
+ifeq ($(TARGET_ARCH),x86)
+    # This flag must be added for x86 targets, but not for ARM
+    libc_crt_target_so_cflags += -fPIC
+endif
 GEN := $(TARGET_OUT_STATIC_LIBRARIES)/crtbegin_so.o
 $(GEN): $(LOCAL_PATH)/arch-$(TARGET_ARCH)/bionic/crtbegin_so.S
 	@mkdir -p $(dir $@)
-	$(TARGET_CC) $(libc_crt_target_cflags) -o $@ -c $<
+	$(TARGET_CC) $(libc_crt_target_so_cflags) -o $@ -c $<
 ALL_GENERATED_SOURCES += $(GEN)
 
 GEN := $(TARGET_OUT_STATIC_LIBRARIES)/crtend_so.o
 $(GEN): $(LOCAL_PATH)/arch-$(TARGET_ARCH)/bionic/crtend_so.S
 	@mkdir -p $(dir $@)
-	$(TARGET_CC) $(libc_crt_target_cflags) -o $@ -c $<
+	$(TARGET_CC) $(libc_crt_target_so_cflags) -o $@ -c $<
 ALL_GENERATED_SOURCES += $(GEN)
-endif # TARGET_ARCH == x86
+endif # TARGET_ARCH == x86 || TARGET_ARCH == arm
 
 
 GEN := $(TARGET_OUT_STATIC_LIBRARIES)/crtbegin_static.o
@@ -587,6 +608,17 @@ include $(CLEAR_VARS)
 
 LOCAL_SRC_FILES := $(libc_common_src_files)
 LOCAL_CFLAGS := $(libc_common_cflags)
+ifdef NEEDS_ARM_ERRATA_754319_754320
+asm_flags := \
+	--defsym NEEDS_ARM_ERRATA_754319_754320_ASM=1
+
+LOCAL_CFLAGS+= \
+	$(foreach f,$(asm_flags),-Wa,"$(f)")
+endif
+
+ifeq ($(TARGET_ARCH),arm)
+LOCAL_CFLAGS += -DCRT_LEGACY_WORKAROUND
+endif
 LOCAL_C_INCLUDES := $(libc_common_c_includes)
 LOCAL_MODULE := libc_common
 LOCAL_SYSTEM_SHARED_LIBRARIES :=
@@ -703,6 +735,7 @@ LOCAL_MODULE:= libc_malloc_debug_leak
 LOCAL_SHARED_LIBRARIES := libc
 LOCAL_WHOLE_STATIC_LIBRARIES := libc_common
 LOCAL_SYSTEM_SHARED_LIBRARIES :=
+LOCAL_ALLOW_UNDEFINED_SYMBOLS := true
 # Don't prelink
 LOCAL_PRELINK_MODULE := false
 # Don't install on release build

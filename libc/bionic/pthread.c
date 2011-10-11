@@ -68,7 +68,13 @@ int  __futex_wait_ex(volatile void *ftx, int pshared, int val, const struct time
 #define  __likely(cond)    __builtin_expect(!!(cond), 1)
 #define  __unlikely(cond)  __builtin_expect(!!(cond), 0)
 
-void _thread_created_hook(pid_t thread_id) __attribute__((noinline));
+#ifdef __i386__
+#define ATTRIBUTES __attribute__((noinline)) __attribute__((fastcall))
+#else
+#define ATTRIBUTES __attribute__((noinline))
+#endif
+
+void ATTRIBUTES _thread_created_hook(pid_t thread_id);
 
 #define PTHREAD_ATTR_FLAG_DETACHED      0x00000001
 #define PTHREAD_ATTR_FLAG_USER_STACK    0x00000002
@@ -372,6 +378,13 @@ int pthread_create(pthread_t *thread_out, pthread_attr_t const * attr,
     return 0;
 }
 
+#ifdef NASTY_PTHREAD_CREATE_HACK
+int _debug_pthread_create(void *debug0, void *debug1, pthread_t *thread,
+        const pthread_attr_t *attr, void *(*start_routine) (void *), void *arg)
+{
+    return pthread_create(thread, attr, start_routine, arg);
+}
+#endif
 
 int pthread_attr_init(pthread_attr_t * attr)
 {
