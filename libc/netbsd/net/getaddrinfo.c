@@ -31,6 +31,15 @@
  */
 
 /*
+ * This version of getaddrinfo.c is derived from Android 2.3 "Gingerbread",
+ * which contains uncredited changes by Android/Google developers.  It has
+ * been modified in 2011 for use in the Android build of Mozilla Firefox by
+ * Mozilla contributors (including Michael Edwards <m.k.edwards@gmail.com>).
+ * These changes are offered under the same license as the original NetBSD
+ * file, whose copyright and license are unchanged above.
+ */
+
+/*
  * Issues to be discussed:
  * - Thread safe-ness must be checked.
  * - Return values.  There are nonstandard return values defined and used
@@ -84,6 +93,7 @@
 #include <sys/param.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/mman.h>
 #include <net/if.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -94,7 +104,6 @@
 #include <netdb.h>
 #include "resolv_private.h"
 #include <stddef.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -103,9 +112,94 @@
 #include <stdarg.h>
 #include "nsswitch.h"
 
+#ifdef MOZ_GETADDRINFO_LOG_VERBOSE
+#include <android/log.h>
+#endif
+
 #ifdef ANDROID_CHANGES
 #include <sys/system_properties.h>
 #endif /* ANDROID_CHANGES */
+
+typedef struct _pseudo_FILE {
+    int fd;
+    off_t maplen;
+    void* mapping;
+    off_t offset;
+} _pseudo_FILE;
+
+#define _PSEUDO_FILE_INITIALIZER { -1, 0, MAP_FAILED, 0 }
+
+static void
+_pseudo_fclose(_pseudo_FILE * __restrict__ fp)
+{
+    assert(fp);
+    fp->offset = 0;
+    if (fp->mapping != MAP_FAILED) {
+        (void) munmap(fp->mapping, fp->maplen);
+        fp->mapping = MAP_FAILED;
+    }
+    fp->maplen = 0;
+    if (fp->fd != -1) {
+        (void) close(fp->fd);
+        fp->fd = -1;
+    }
+}
+
+static _pseudo_FILE *
+_pseudo_fopen_r(_pseudo_FILE * __restrict__ fp, const char* fname)
+{
+    struct stat statbuf;
+    assert(fp);
+    fp->fd = open(fname, O_RDONLY);
+    if (fp->fd < 0) {
+        fp->fd = -1;
+        return NULL;
+    }
+    if ((0 != fstat(fp->fd, &statbuf)) || (statbuf.st_size <= 0)) {
+        close(fp->fd);
+        fp->fd = -1;
+        return NULL;
+    }
+    fp->maplen = statbuf.st_size;
+    fp->mapping = mmap(NULL, fp->maplen, PROT_READ, MAP_PRIVATE, fp->fd, 0);
+    if (fp->mapping == MAP_FAILED) {
+        close(fp->fd);
+        fp->fd = -1;
+        return NULL;
+    }
+    fp->offset = 0;
+    return fp;
+}
+
+static void
+_pseudo_rewind(_pseudo_FILE * __restrict__ fp)
+{
+    assert(fp);
+    fp->offset = 0;
+}
+
+static char*
+_pseudo_fgets(char* buf, int bufsize, _pseudo_FILE * __restrict__ fp)
+{
+    char* current;
+    char* endp;
+    int maxcopy;
+    assert(fp);
+    maxcopy = fp->maplen - fp->offset;
+    if (fp->mapping == MAP_FAILED)
+        return NULL;
+    if (maxcopy > bufsize - 1)
+        maxcopy = bufsize - 1;
+    if (maxcopy <= 0)
+        return NULL;
+    current = ((char*) fp->mapping) + fp->offset;
+    endp = memccpy(buf, current, '\n', maxcopy);
+    if (endp)
+        maxcopy = endp - buf;
+    buf[maxcopy] = '\0';
+    fp->offset += maxcopy;
+    return buf;
+}
 
 typedef union sockaddr_union {
     struct sockaddr     generic;
@@ -231,9 +325,9 @@ static int ip6_str2scopeid(char *, struct sockaddr_in6 *, u_int32_t *);
 static struct addrinfo *getanswer(const querybuf *, int, const char *, int,
 	const struct addrinfo *);
 static int _dns_getaddrinfo(void *, void *, va_list);
-static void _sethtent(FILE **);
-static void _endhtent(FILE **);
-static struct addrinfo *_gethtent(FILE **, const char *,
+static void _sethtent(_pseudo_FILE * __restrict__);
+static void _endhtent(_pseudo_FILE * __restrict__);
+static struct addrinfo *_gethtent(_pseudo_FILE * __restrict__, const char *,
     const struct addrinfo *);
 static int _files_getaddrinfo(void *, void *, va_list);
 
@@ -398,191 +492,6 @@ _have_ipv4() {
         return _test_connect(PF_INET, &addr.generic, sizeof(addr.in));
 }
 
-// Returns 0 on success, else returns non-zero on error (in which case
-// getaddrinfo should continue as normal)
-static int
-android_getaddrinfo_proxy(
-    const char *hostname, const char *servname,
-    const struct addrinfo *hints, struct addrinfo **res)
-{
-	int sock;
-	const int one = 1;
-	struct sockaddr_un proxy_addr;
-	const char* cache_mode = getenv("ANDROID_DNS_MODE");
-	FILE* proxy = NULL;
-	int success = 0;
-
-	// Clear this at start, as we use its non-NULLness later (in the
-	// error path) to decide if we have to free up any memory we
-	// allocated in the process (before failing).
-	*res = NULL;
-
-	if (cache_mode != NULL && strcmp(cache_mode, "local") == 0) {
-		// Don't use the proxy in local mode.  This is used by the
-		// proxy itself.
-		return -1;
-	}
-
-	// Temporary cautious hack to disable the DNS proxy for processes
-	// requesting special treatment.  Ideally the DNS proxy should
-	// accomodate these apps, though.
-	char propname[PROP_NAME_MAX];
-	char propvalue[PROP_VALUE_MAX];
-	snprintf(propname, sizeof(propname), "net.dns1.%d", getpid());
-	if (__system_property_get(propname, propvalue) > 0) {
-		return -1;
-	}
-
-	// Bogus things we can't serialize.  Don't use the proxy.
-	if ((hostname != NULL &&
-	     strcspn(hostname, " \n\r\t^'\"") != strlen(hostname)) ||
-	    (servname != NULL &&
-	     strcspn(servname, " \n\r\t^'\"") != strlen(servname))) {
-		return -1;
-	}
-
-	sock = socket(AF_UNIX, SOCK_STREAM, 0);
-	if (sock < 0) {
-		return -1;
-	}
-
-	setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-	memset(&proxy_addr, 0, sizeof(proxy_addr));
-	proxy_addr.sun_family = AF_UNIX;
-	strlcpy(proxy_addr.sun_path, "/dev/socket/dnsproxyd",
-		sizeof(proxy_addr.sun_path));
-	if (TEMP_FAILURE_RETRY(connect(sock,
-				       (const struct sockaddr*) &proxy_addr,
-				       sizeof(proxy_addr))) != 0) {
-		close(sock);
-		return -1;
-	}
-
-	// Send the request.
-	proxy = fdopen(sock, "r+");
-	if (fprintf(proxy, "getaddrinfo %s %s %d %d %d %d",
-		    hostname == NULL ? "^" : hostname,
-		    servname == NULL ? "^" : servname,
-		    hints == NULL ? -1 : hints->ai_flags,
-		    hints == NULL ? -1 : hints->ai_family,
-		    hints == NULL ? -1 : hints->ai_socktype,
-		    hints == NULL ? -1 : hints->ai_protocol) < 0) {
-		goto exit;
-	}
-	// literal NULL byte at end, required by FrameworkListener
-	if (fputc(0, proxy) == EOF ||
-	    fflush(proxy) != 0) {
-		goto exit;
-	}
-
-	int remote_rv;
-	if (fread(&remote_rv, sizeof(int), 1, proxy) != 1) {
-		goto exit;
-	}
-
-	if (remote_rv != 0) {
-		goto exit;
-	}
-
-	struct addrinfo* ai = NULL;
-	struct addrinfo** nextres = res;
-	while (1) {
-		uint32_t addrinfo_len;
-		if (fread(&addrinfo_len, sizeof(addrinfo_len),
-			  1, proxy) != 1) {
-			break;
-		}
-		addrinfo_len = ntohl(addrinfo_len);
-		if (addrinfo_len == 0) {
-			success = 1;
-			break;
-		}
-
-		if (addrinfo_len < sizeof(struct addrinfo)) {
-			break;
-		}
-		struct addrinfo* ai = calloc(1, addrinfo_len +
-					     sizeof(struct sockaddr_storage));
-		if (ai == NULL) {
-			break;
-		}
-
-		if (fread(ai, addrinfo_len, 1, proxy) != 1) {
-			// Error; fall through.
-			break;
-		}
-
-		// Zero out the pointer fields we copied which aren't
-		// valid in this address space.
-		ai->ai_addr = NULL;
-		ai->ai_canonname = NULL;
-		ai->ai_next = NULL;
-
-		// struct sockaddr
-		uint32_t addr_len;
-		if (fread(&addr_len, sizeof(addr_len), 1, proxy) != 1) {
-			break;
-		}
-		addr_len = ntohl(addr_len);
-		if (addr_len != 0) {
-			if (addr_len > sizeof(struct sockaddr_storage)) {
-				// Bogus; too big.
-				break;
-			}
-			struct sockaddr* addr = (struct sockaddr*)(ai + 1);
-			if (fread(addr, addr_len, 1, proxy) != 1) {
-				break;
-			}
-			ai->ai_addr = addr;
-		}
-
-		// cannonname
-		uint32_t name_len;
-		if (fread(&name_len, sizeof(name_len), 1, proxy) != 1) {
-			break;
-		}
-		name_len = ntohl(name_len);
-		if (name_len != 0) {
-			ai->ai_canonname = (char*) malloc(name_len);
-			if (fread(ai->ai_canonname, name_len, 1, proxy) != 1) {
-				break;
-			}
-			if (ai->ai_canonname[name_len - 1] != '\0') {
-				// The proxy should be returning this
-				// NULL-terminated.
-				break;
-			}
-		}
-
-		*nextres = ai;
-		nextres = &ai->ai_next;
-		ai = NULL;
-	}
-
-	if (ai != NULL) {
-		// Clean up partially-built addrinfo that we never ended up
-		// attaching to the response.
-		freeaddrinfo(ai);
-	}
-exit:
-	if (proxy != NULL) {
-		fclose(proxy);
-	}
-
-	if (success) {
-		return 0;
-	}
-
-	// Proxy failed; fall through to local
-	// resolver case.  But first clean up any
-	// memory we might've allocated.
-	if (*res) {
-		freeaddrinfo(*res);
-		*res = NULL;
-	}
-	return -1;
-}
-
 int
 getaddrinfo(const char *hostname, const char *servname,
     const struct addrinfo *hints, struct addrinfo **res)
@@ -728,13 +637,6 @@ getaddrinfo(const char *hostname, const char *servname,
 		ERR(EAI_NODATA);
 	if (pai->ai_flags & AI_NUMERICHOST)
 		ERR(EAI_NONAME);
-
-        /*
-         * BEGIN ANDROID CHANGES; proxying to the cache
-         */
-        if (android_getaddrinfo_proxy(hostname, servname, hints, res) == 0) {
-            return 0;
-        }
 
 	/*
 	 * hostname as alphabetical name.
@@ -1540,7 +1442,7 @@ _get_scope(const struct sockaddr *addr)
 
 /* RFC 4380, section 2.6 */
 #define IN6_IS_ADDR_TEREDO(a)	 \
-	((a)->s6_addr32[0] == ntohl(0x20010000))
+	((*(const uint32_t *)(const void *)(&(a)->s6_addr[0]) == ntohl(0x20010000)))
 
 /* RFC 3056, section 2. */
 #define IN6_IS_ADDR_6TO4(a)	 \
@@ -1996,27 +1898,24 @@ _dns_getaddrinfo(void *rv, void	*cb_data, va_list ap)
 }
 
 static void
-_sethtent(FILE **hostf)
+_sethtent(_pseudo_FILE * __restrict__ hostf)
 {
-
-	if (!*hostf)
-		*hostf = fopen(_PATH_HOSTS, "r" );
+	assert(hostf);
+	if (hostf->mapping == MAP_FAILED)
+		(void) _pseudo_fopen_r(hostf, _PATH_HOSTS);
 	else
-		rewind(*hostf);
+		_pseudo_rewind(hostf);
 }
 
 static void
-_endhtent(FILE **hostf)
+_endhtent(_pseudo_FILE * __restrict__ hostf)
 {
-
-	if (*hostf) {
-		(void) fclose(*hostf);
-		*hostf = NULL;
-	}
+	assert(hostf);
+	(void) _pseudo_fclose(hostf);
 }
 
 static struct addrinfo *
-_gethtent(FILE **hostf, const char *name, const struct addrinfo *pai)
+_gethtent(_pseudo_FILE * __restrict__ hostf, const char *name, const struct addrinfo *pai)
 {
 	char *p;
 	char *cp, *tname, *cname;
@@ -2025,14 +1924,17 @@ _gethtent(FILE **hostf, const char *name, const struct addrinfo *pai)
 	const char *addr;
 	char hostbuf[8*1024];
 
+	assert(hostf);
 //	fprintf(stderr, "_gethtent() name = '%s'\n", name);
 	assert(name != NULL);
 	assert(pai != NULL);
 
-	if (!*hostf && !(*hostf = fopen(_PATH_HOSTS, "r" )))
+	if (hostf->mapping == MAP_FAILED)
+		(void) _pseudo_fopen_r(hostf, _PATH_HOSTS);
+	if (hostf->mapping == MAP_FAILED)
 		return (NULL);
  again:
-	if (!(p = fgets(hostbuf, sizeof hostbuf, *hostf)))
+	if (!(p = _pseudo_fgets(hostbuf, sizeof hostbuf, hostf)))
 		return (NULL);
 	if (*p == '#')
 		goto again;
@@ -2089,7 +1991,7 @@ _files_getaddrinfo(void *rv, void *cb_data, va_list ap)
 	const struct addrinfo *pai;
 	struct addrinfo sentinel, *cur;
 	struct addrinfo *p;
-	FILE *hostf = NULL;
+	_pseudo_FILE hostf = _PSEUDO_FILE_INITIALIZER;
 
 	name = va_arg(ap, char *);
 	pai = va_arg(ap, struct addrinfo *);
